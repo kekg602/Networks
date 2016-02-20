@@ -162,11 +162,28 @@ def checkForLoops(source, cost2, portIdOfBPDU):
 		if id > source:
 			print "odd loop"
 			resolveOddLoop(portIdOfBPDU)
-		# if we detect a loop, and don't
-		# deal with it from this end
-		# need to flush the table if
-		else:
+#		# if we detect a loop, and don't
+#		# deal with it from this end
+#		# need to flush the table if
+#		else:
+#			flushForwardingTable()
+
+# 
+		# if we detect a loop, and don't deal with it from this end,
+		# that means that the bridge we received a BPDU from and our bridge 
+		# have the same cost to root. But since our ID is lower, one of our ports
+		# connected to this particular LAN will be the designated port for that LAN
+		else: 
+                        # regardless of what port will be determined as the Designated Port for this LAN
+			# on the bridge, there will be atleast one change in port state for one of the ports connected 
+                        # Hence, the forwarding table must be flushed. 
 			flushForwardingTable()
+ 			
+			# we are the designated bridge for the lan this particular port connects to (for now)
+			# now we need to find out what is the designated port on the bridge for this LAN
+			# incase there are multiple ports on this bridge that connect to this LAN
+			determineDesignatedPort(portIdofBPDU)
+
 		return
 
 	# if we receive two BPDUs with the same cost
@@ -201,7 +218,9 @@ def resolveRootLoop(portIdOfBPDU, portIdOfEntry):
 		disable = portIdOfBPDU
 	else:
 		disable = portIdOfEntry
-
+# P.S. one of the ports changed state here (im not sure which one)
+# but I think we have to print print("New root:" + id + "/" + root)
+# when the bridge changes its root port... not sure if it goes in the if or else clause  
 	if disable != -1 and not(disable in disabledPorts):
 		disabledPorts.append(disable)
 		print "Disabled port " + id + "/" + str(disable)

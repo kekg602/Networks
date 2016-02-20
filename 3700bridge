@@ -75,8 +75,15 @@ def updateForwardingTable(source, socket):
  	# if it is update age
     	for entry in forwardingTable:
     		if entry[TABLE_ADDR] == source:
-        		updateForwardingAge(source)
-        		inTable = 1
+			# if we are receiving this message over a
+			# a different port than in the table update
+			# the port
+			if entry[TABLE_PORT_ID] != socket.fileno():
+	        		entry[TABLE_PORT_ID] = socket.fileno()
+
+			entry[TABLE_AGE] = time.time()
+       			inTable = 1
+			return
 
 	# if not add it
    	if not bool(inTable):
@@ -90,12 +97,9 @@ def addToForwardingTable(addr, socket):
 	forwardingTable.append([portId, addr, time.time()])	
 
 # update the age of a forwarding table entry
-def updateForwardingAge(addr):
-	global TABLE_ADDR, TABLE_AGE
-	
-	for entry in forwardingTable:
-		if entry[TABLE_ADDR] == addr:
-			entry[TABLE_AGE] = time.time()
+#def updateForwardingAge(addr):
+#	global TABLE_ADDR, TABLE_AGE
+#	entry[TABLE_AGE] = time.time()
 
 # check the forwarding table for timeouts
 def checkForwardingEntryAge():
@@ -110,6 +114,7 @@ def checkForwardingEntryAge():
 			removeList.append(entry)
 
 	for tempEntry in removeList:
+		print "REMOVING FROM FORWARDING TABLE " + str(entry[TABLE_ADDR]) + " " + str(entry[PORT_ID])
 		forwardingTable.remove(tempEntry)
 
 # flush forwarding table
@@ -155,18 +160,21 @@ def getSocket(destPortId):
 # check for loops between bridges
 def checkForLoops(source, cost2, portIdOfBPDU):
 
+	if rootPortId == -1:
+		return
+
 	# if we receive a BPDU with the same cost
 	# as us and our id is higher, disable one
 	# our port connected to it
 	if cost == cost2:
 		if id > source:
-			print "odd loop"
 			resolveOddLoop(portIdOfBPDU)
 		# if we detect a loop, and don't
 		# deal with it from this end
 		# need to flush the table if
 		else:
-			flushForwardingTable()
+			sendBPDU()
+			#flushForwardingTable()
 		return
 
 	# if we receive two BPDUs with the same cost
@@ -176,7 +184,6 @@ def checkForLoops(source, cost2, portIdOfBPDU):
 	for entry in bridges:
 		if entry[BRIDGE_COST] == cost2 and portIdOfBPDU != entry[BRIDGE_PORT_ID]:
 			if source < id:
-				print "even loop" + str(source)
 				
 				# if there is a direct loop with the root
 				if entry[BRIDGE_ID] == source == root:
@@ -190,7 +197,8 @@ def checkForLoops(source, cost2, portIdOfBPDU):
 			# if we detect a loop and don't deal with
 			# it here, still need to flush table
 			else:
-				flushForwardingTable()
+				sendBPDU()
+			#	flushForwardingTable()
 
 # if there is a direct loop between the root and
 # our bridge, disable the port connected to the
@@ -202,7 +210,7 @@ def resolveRootLoop(portIdOfBPDU, portIdOfEntry):
 	else:
 		disable = portIdOfEntry
 
-	if disable != -1 and not(disable in disabledPorts):
+	if disable != -1 and not(disable in disabledPorts) and disable != rootPortId:
 		disabledPorts.append(disable)
 		print "Disabled port " + id + "/" + str(disable)
 		flushForwardingTable()
@@ -218,7 +226,7 @@ def resolveDirectLoop(portIdOfBPDU, portIdOfEntry):
 	else:
 		disable = portIdOfEntry
 
-	if disable != -1 and not(disable in disabledPorts):
+	if disable != -1 and not(disable in disabledPorts) and disable != rootPortId:
 		disabledPorts.append(disable)
 		print "Disabled port " + id + "/" + str(disable)
 		flushForwardingTable()
@@ -228,7 +236,7 @@ def resolveDirectLoop(portIdOfBPDU, portIdOfEntry):
 # if they have the higher id it will be handled
 # by them
 def resolveOddLoop(portIdOfBPDU):
-	if not(portIdOfBPDU in disabledPorts):
+	if not(portIdOfBPDU in disabledPorts) and portIdOfBPDU != rootPortId:
 	       	disabledPorts.append(portIdOfBPDU)
                 print "Disabled port " + id + "/" + str(portIdOfBPDU)
                 flushForwardingTable()
@@ -246,7 +254,7 @@ def resolveEvenLoop(portIdOfBPDU, portIdOfEntry):
 	else:
 		disable = portIdOfBPDU
 
-	if not(disable in disabledPorts):	
+	if not(disable in disabledPorts) and disable != rootPortId:	
 	        disabledPorts.append(disable)
 		print "disabled even from " + source
         	print "Disabled port " + id + "/" + str(disable)
@@ -294,7 +302,7 @@ if __name__ == "__main__":
 	cost = 0
 
 	# keep track of the root port
-	rootPortId = 0
+	rootPortId = -1
 
 	# which sockets are ready
 	ready = []
@@ -394,8 +402,8 @@ if __name__ == "__main__":
 				# if the cost and root of the current bridge
 				# and the message that the bridge is from are
 				# the same but the port id the message is from is
-				# lower, update the root port
-				elif root2 == root and cost == (cost2 - 1) and messagePortId < rootPortId:
+				# lower or rootport hasn't been set update the root port
+				elif root2 == root and cost == (cost2 - 1) and (messagePortId < rootPortId or rootPortId == -1):
 					updateRootPort(messagePortId)
 
 				# check for loops in network
@@ -415,10 +423,12 @@ if __name__ == "__main__":
 				delegateMessage = 1
 
 		                # see if message is coming over a disabled port
-				# if so ignore it
-        			for portId in disabledPorts:
-                			if x.fileno() == portId:
-						delegateMessage = 0
+				# if so broadcast back to see if whoever sent
+				# it has an invalid entry in their forwarding
+				# table and then ignore it
+				if messagePortId in disabledPorts:
+					#sendData(x, data)
+					delegateMessage = 0
                                                 
 				if delegateMessage == 1:
 
@@ -438,29 +448,47 @@ if __name__ == "__main__":
 			                print "Received message " + str(messageId) + " on port " + str(sourcePortId) + " from " + str(source) + " to " + str(dest)
 							
 					# now make a decision about the message	
-					# if message being sent to this id, was sent by us,
-					# was sent on a host on the same LAN or was sent to
-					# itself, do not forward it
-       		        		if dest == id or dest == source or source == id or destPortId == sourcePortId:
-               					print "Not forwarding message " + str(messageId)
+
+					ignore = 0
+					# if the message destination is in our table
+					# and came over a port that we thought we
+					# should have sent it on, broadcast it
+					# and flush our table cause there is
+					# faulty data
+					#for entry in forwardingTable:
+					#	if dest == entry[TABLE_ADDR] and messagePortId == entry[TABLE_PORT_ID]:
+					#		print "WE GOT HERE" 
+					#		print "Broadcasting message " + str(messageId) + " to all ports"
+					#		ignore = 1
+					#		for sock in sockets:
+					#			if sock != x:
+					#				sendData(sock, data)
+					#		flushForwardingTable()
+							
+					if ignore == 0:
+						# if message being sent to this id, was sent by us,
+						# was sent on a host on the same LAN or was sent to
+						# itself, do not forward it
+       		        			if dest == id or dest == source or source == id or destPortId == sourcePortId:
+               						print "Not forwarding message " + str(messageId)
 	
-					# if dest in forwarding table, forward it
-					elif destPortId != -1:
-						# get socket/port to send over
-						sock = getSocket(destPortId)
+						# if dest in forwarding table, forward it
+						elif destPortId != -1:
+							# get socket/port to send over
+							sock = getSocket(destPortId)
 				
-						# double check to not send over disabled port
-						if not(sock.fileno() in disabledPorts):
-							print "Forwarding message " + str(messageId) + " to port " + str(destPortId)
-							sendData(sock, data)
-						else:
-							print "Not forwarding message " + str(messageId)
-					
-					# if dest is not in forwarding table, broadcast
-					else :
-						print "Broadcasting message " + str(messageId) + " to all ports"
-						
-						# send over all ports, except one received on and disabled
-						for sock in sockets:
-							if sock.fileno() != x.fileno() and not(sock.fileno() in disabledPorts):
+							# double check to not send over disabled port
+							if not(sock.fileno() in disabledPorts):
+								print "Forwarding message " + str(messageId) + " to port " + str(destPortId)
 								sendData(sock, data)
+							else:
+								print "Not forwarding message " + str(messageId)
+					
+						# if dest is not in forwarding table, broadcast
+						else :
+							print "Broadcasting message " + str(messageId) + " to all ports"
+							
+							# send over all ports, except one received on and disabled
+							for sock in sockets:
+								if sock.fileno() != x.fileno() and not(sock.fileno() in disabledPorts):
+									sendData(sock, data)

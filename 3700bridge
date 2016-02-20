@@ -1,0 +1,466 @@
+#!/usr/bin/python -u    
+# The -u makes output unbuffered, so it will show up immediately
+import sys
+import socket
+import select
+import json
+import time
+
+# pads the name with null bytes at the end
+def pad(name):
+        result = '\0' + name
+        while len(result) < 108:
+        	result += '\0'
+        return result
+ 
+# send BPDUs
+def sendBPDU():
+	global lastSentBPDU
+	
+	for socket in ready:
+    		message = {"source":"" + id + "", "dest":"ffff", "type":"bpdu", "message":{"id":"" + id + "", "root":""+ root + "",  "cost": cost}}
+        	socket.send(json.dumps(message))
+	
+	# update timestamp
+	lastSentBPDU = time.time()
+
+#send data message
+def sendData(socket, data):
+	socket.send(data)
+
+# update the information for a bridge entry
+def updateBridgeTable(bridgeId, bridgeCost, portId, bridgeRoot):
+	
+	inTable = 0
+	
+	# update the bridge information, make sure
+	# the information is coming from the same port
+	# as before, if it is not add bridge with
+	# different port info
+    	for entry in bridges: 
+		if entry[BRIDGE_ID] == bridgeId:
+			if portId == entry[BRIDGE_PORT_ID]:
+				entry[BRIDGE_AGE] = time.time()
+				entry[BRIDGE_COST] = bridgeCost
+				entry[BRIDGE_ROOT] = bridgeRoot
+				inTable = 1
+				return
+			
+	# if the bridge isn't in the table yet, add it
+	if (not bool(inTable)): 
+		addToBridgeTable(bridgeId, bridgeCost, portId, bridgeRoot)
+
+# add entry to bridge table. each entry includes: bridgeID, age, port, cost
+def addToBridgeTable(bridgeId, bridgeCost, portId, bridgeRoot):
+	print "ADDING TO BRIDGE TABLE " + str(bridgeId) + " " + str(portId)
+        bridges.append([bridgeId, time.time(), portId, bridgeCost, bridgeRoot])   
+	#sendBPDU()
+	
+# check if a bridge has gone down
+def checkBridgeAge():
+	global BRIDGE_AGE
+	
+	for entry in bridges:
+	# check if a bridge has gone down (hasn't sent a 750 ms) 
+		if (time.time() - entry[BRIDGE_AGE]) >= .75:
+		# if so, send out BPDUs and flush bridges and ForwardingTable 
+			sendBPDU()
+			flushForwardingTable()
+			flushBridgesTable()
+			
+def updateForwardingTable(source, socket):
+	# check to see if source is in table
+	inTable = 0
+	
+ 	# if it is update age
+    	for entry in forwardingTable:
+    		if entry[TABLE_ADDR] == source:
+        		updateForwardingAge(source)
+        		inTable = 1
+
+	# if not add it
+   	if not bool(inTable):
+	    	addToForwardingTable(source, socket)
+				
+# add entry to forwarding table
+def addToForwardingTable(addr, socket):
+	# add port id(the socket fd), address, current time
+	print "ADDING TO FORWARDING TABLE " + str(addr) + " " + str(socket.fileno())
+	portId = socket.fileno()
+	forwardingTable.append([portId, addr, time.time()])	
+
+# update the age of a forwarding table entry
+def updateForwardingAge(addr):
+	global TABLE_ADDR, TABLE_AGE
+	
+	for entry in forwardingTable:
+		if entry[TABLE_ADDR] == addr:
+			entry[TABLE_AGE] = time.time()
+
+# check the forwarding table for timeouts
+def checkForwardingEntryAge():
+	# if an entry is 5 seconds old or older
+	# remove entry
+	removeList = []
+
+	global TABLE_AGE
+
+	for entry in forwardingTable:
+		if (time.time() - entry[TABLE_AGE]) >= 5:
+			removeList.append(entry)
+
+	for tempEntry in removeList:
+		forwardingTable.remove(tempEntry)
+
+# flush forwarding table
+def flushForwardingTable():
+	forwardingTable = []
+
+# flush bridges table
+def flushBridgesTable():
+	bridges = [] 
+
+# update this bridge's root port and flush
+# forwarding table
+def updateRootPort(portId):
+	global rootPortId
+
+	if rootPortId != portId:
+		rootPortId = portId
+		print "Root port: " + id + "/" + str(rootPortId)
+		flushForwardingTable()
+
+		# send out BPDU
+		sendBPDU()
+
+# get port id for an entry in the forwarding table
+def getPortId(dest):
+	global TABLE_ADDR, TABLE_PORT_ID
+	for entry in forwardingTable:
+		if entry[TABLE_ADDR] == dest:
+			return entry[TABLE_PORT_ID]
+
+	# if dest not in table, return -1
+	return -1
+
+# get socket to send message on
+def getSocket(destPortId):
+	# go through sockets if the port id
+	# (the file descriptor) matches up with the
+	# destination port id, return the socket
+	for socket in sockets:
+		if socket.fileno() == destPortId:
+			return socket
+
+# check for loops between bridges
+def checkForLoops(source, cost2, portIdOfBPDU):
+
+	# if we receive a BPDU with the same cost
+	# as us and our id is higher, disable one
+	# our port connected to it
+	if cost == cost2:
+		if id > source:
+			print "odd loop"
+			resolveOddLoop(portIdOfBPDU)
+		# if we detect a loop, and don't
+		# deal with it from this end
+		# need to flush the table if
+		else:
+			flushForwardingTable()
+		return
+
+	# if we receive two BPDUs with the same cost
+	# as one another but on two different ports then there
+	# is a loop, only fix it from this end if our id is higher
+	# than the source's 
+	for entry in bridges:
+		if entry[BRIDGE_COST] == cost2 and portIdOfBPDU != entry[BRIDGE_PORT_ID]:
+			if source < id:
+				print "even loop" + str(source)
+				
+				# if there is a direct loop with the root
+				if entry[BRIDGE_ID] == source == root:
+					resolveRootLoop(portIdOfBPDU, entry[BRIDGE_PORT_ID])
+				# if there is a direct loop with another bridge that's not the root
+				elif entry[BRIDGE_ID] == source and source != root:
+					resolveDirectLoop(portIdOfBPDU, entry[BRIDGE_PORT_ID])
+				# if there is a larger loop with an even number of bridges
+				elif entry[BRIDGE_ID] != source and source != root:
+					resolveEvenLoop(portIdOfBPDU, entry[BRIDGE_PORT_ID])
+			# if we detect a loop and don't deal with
+			# it here, still need to flush table
+			else:
+				flushForwardingTable()
+
+# if there is a direct loop between the root and
+# our bridge, disable the port connected to the
+# root with the higher id
+def resolveRootLoop(portIdOfBPDU, portIdOfEntry):
+	disable = -1
+	if portIdOfBPDU > portIdOfEntry:
+		disable = portIdOfBPDU
+	else:
+		disable = portIdOfEntry
+
+	if disable != -1 and not(disable in disabledPorts):
+		disabledPorts.append(disable)
+		print "Disabled port " + id + "/" + str(disable)
+		flushForwardingTable()
+
+# if there is a direct loop between this bridge
+# and another one and this bridge has a higher id
+# disable the port that is connected to ours with
+# the higher port id
+def resolveDirectLoop(portIdOfBPDU, portIdOfEntry):
+	disable = -1
+	if portIdOfBPDU > portIdOfEntry:
+		disable = portIdOfBPDU
+	else:
+		disable = portIdOfEntry
+
+	if disable != -1 and not(disable in disabledPorts):
+		disabledPorts.append(disable)
+		print "Disabled port " + id + "/" + str(disable)
+		flushForwardingTable()
+	
+# resolve loops with odd amount of bridges
+# if we have the higher id, disable our port
+# if they have the higher id it will be handled
+# by them
+def resolveOddLoop(portIdOfBPDU):
+	if not(portIdOfBPDU in disabledPorts):
+	       	disabledPorts.append(portIdOfBPDU)
+                print "Disabled port " + id + "/" + str(portIdOfBPDU)
+                flushForwardingTable()
+
+# if there is a loop between an even amount of bridges
+# disable the port that is not a root port or the
+# port with the higher port id
+def resolveEvenLoop(portIdOfBPDU, portIdOfEntry):
+
+	disable = -1
+
+	# disable the port with the higher id
+	if portIdOfBPDU < portIdOfEntry:
+		disable = portIdOfEntry
+	else:
+		disable = portIdOfBPDU
+
+	if not(disable in disabledPorts):	
+	        disabledPorts.append(disable)
+		print "disabled even from " + source
+        	print "Disabled port " + id + "/" + str(disable)
+	        flushForwardingTable()
+
+if __name__ == "__main__":
+	id = sys.argv[1]
+    	LAN = sys.argv[2:]
+    	sockets = []
+
+	# keeps track of LANs the bridge is connected to
+	# and what port id they are connected by
+	connectedLANS = {}
+	        
+	tempRemoveSockets = []
+
+    	# creates sockets and connects to them
+	# if there is a socket that connects to a LAN
+	# the bridge is already connected to, add it to
+	# the list to be removed after
+    	for x in range(len(LAN)):
+        	s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        	s.connect(pad(LAN[x]))
+		sockets.append(s)
+	
+		# if already connected to this lan
+		if LAN[x] in connectedLANS:
+	        	tempRemoveSockets.append(s)
+			print "Disabled port " + id + "/" + str(s.fileno())
+		# if not add to list
+		else:
+			connectedLANS[LAN[x]] = s.fileno()
+
+	# remove duplicate connections to LANs
+	for sock in tempRemoveSockets:
+		sockets.remove(sock)
+
+	# keep track of disabledPorts
+	disabledPorts = []
+        
+    	print "Bridge " + id + " starting up\n"
+	
+	# initialize root and cost - root will be id and cost will be 0
+	root = id
+	cost = 0
+
+	# keep track of the root port
+	rootPortId = 0
+
+	# which sockets are ready
+	ready = []
+
+	# table of active bridges 
+	# has the following: bridgeID, age of last BPDU, portID/socket, cost to root  
+	bridges = [] 
+
+	# bridge table entry constants
+	BRIDGE_ID = 0
+	BRIDGE_AGE = 1
+	BRIDGE_PORT_ID = 2
+	BRIDGE_COST = 3
+	BRIDGE_ROOT = 4
+
+	# forwarding table to hold port ids, addresses, age
+	# of different entries
+	forwardingTable = []
+
+	# forwarding table entry constants
+	TABLE_PORT_ID = 0;
+	TABLE_ADDR = 1;
+	TABLE_AGE = 2;
+
+	# send first bpdu, have timestamp to keep track of when
+	# last one was sent
+	lastSentBPDU = -1
+	sendBPDU()
+
+        # Main loop
+        while True:
+	
+                # select with all the sockets; timeout value is 100ms
+                ready, ignore, ignore2 = select.select(sockets, [], [], 0.1)
+
+		# send out periodic BPDUs
+		if time.time() - lastSentBPDU >= .1:
+			sendBPDU()
+
+		# see if any BPDUs have timed out
+		checkBridgeAge()
+
+                # Reads from each of the ready sockets
+                for x in ready:
+
+			data = x.recv(1500)
+	
+			# the port id (or the socket file descriptor)
+			messagePortId = x.fileno()
+			
+			# decode json
+			dictionary = json.loads(data)
+			source = dictionary["source"]
+			dest = dictionary["dest"]
+			messageType = dictionary["type"]
+			message = dictionary["message"]
+
+			# if the message is a bpdu
+			if messageType == "bpdu":
+
+				#print "SOURCE " + str(source) + " " + str(messagePortId)						
+
+				# get data out of message
+				#id2 = dictionary["message"]["id"]
+				root2 = dictionary["message"]["root"]
+				cost2 = dictionary["message"]["cost"]
+			
+				# update bridge table
+				updateBridgeTable(str(source), cost2, messagePortId, root2)
+	
+				# compare data to current bridge
+				# update the root if the bpdu sends a 
+				# message with a lower root than us
+				if root2 < root:
+					#reset root and cost
+					root = root2
+					cost = cost2 + 1
+	
+					# print out message
+					print("New root:" + id + "/" + root)
+
+					# update root port to one connected to
+					# bridge that sent the bpdu
+					updateRootPort(messagePortId)
+					
+				# if the cost of the bridge who sent the 
+				# bpdu offers a better path to the root
+				# and is not equal to ours
+				elif root2 == root and cost2 + 1 < cost:
+					# update cost
+					cost = cost2 + 1
+	
+					# update root port to one connected to
+					# bridge that sent bpdu
+					updateRootPort(messagePortId)
+
+				# if the cost and root of the current bridge
+				# and the message that the bridge is from are
+				# the same but the port id the message is from is
+				# lower, update the root port
+				elif root2 == root and cost == (cost2 - 1) and messagePortId < rootPortId:
+					updateRootPort(messagePortId)
+
+				# check for loops in network
+				# to see if we need to disable ports
+				# do not disable ports when the id is
+				# the same as our bridge or our bridge
+				# is the root, do not check for loops until
+				# everyone in table has the same root
+				if id != source and id != root:
+					checkForLoops(source, cost2, messagePortId)
+
+				# designated ports
+			
+			# if message is data
+			elif messageType == "data":				
+
+				delegateMessage = 1
+
+		                # see if message is coming over a disabled port
+				# if so ignore it
+        			for portId in disabledPorts:
+                			if x.fileno() == portId:
+						delegateMessage = 0
+                                                
+				if delegateMessage == 1:
+
+					# check if source is in forwarding table
+					updateForwardingTable(source, x)
+
+					# get rest of data from message
+					messageId = dictionary["message"]["id"]
+	
+					# get the port id for the destination
+					destPortId = -1
+					destPortId = getPortId(dest)
+
+					# source port id is file descriptor
+					sourcePortId = x.fileno()
+
+			                print "Received message " + str(messageId) + " on port " + str(sourcePortId) + " from " + str(source) + " to " + str(dest)
+							
+					# now make a decision about the message	
+					# if message being sent to this id, was sent by us,
+					# was sent on a host on the same LAN or was sent to
+					# itself, do not forward it
+       		        		if dest == id or dest == source or source == id or destPortId == sourcePortId:
+               					print "Not forwarding message " + str(messageId)
+	
+					# if dest in forwarding table, forward it
+					elif destPortId != -1:
+						# get socket/port to send over
+						sock = getSocket(destPortId)
+				
+						# double check to not send over disabled port
+						if not(sock.fileno() in disabledPorts):
+							print "Forwarding message " + str(messageId) + " to port " + str(destPortId)
+							sendData(sock, data)
+						else:
+							print "Not forwarding message " + str(messageId)
+					
+					# if dest is not in forwarding table, broadcast
+					else :
+						print "Broadcasting message " + str(messageId) + " to all ports"
+						
+						# send over all ports, except one received on and disabled
+						for sock in sockets:
+							if sock.fileno() != x.fileno() and not(sock.fileno() in disabledPorts):
+								sendData(sock, data)

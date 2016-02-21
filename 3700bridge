@@ -29,7 +29,7 @@ def sendData(socket, data):
 	socket.send(data)
 
 # update the information for a bridge entry
-def updateBridgeTable(bridgeId, bridgeCost, portId, bridgeRoot):
+def updateBridgeTable(bridgeId, bridgeCost, portId):
 	
 	inTable = 0
 	
@@ -42,21 +42,25 @@ def updateBridgeTable(bridgeId, bridgeCost, portId, bridgeRoot):
 			if portId == entry[BRIDGE_PORT_ID]:
 				entry[BRIDGE_AGE] = time.time()
 				entry[BRIDGE_COST] = bridgeCost
-				entry[BRIDGE_ROOT] = bridgeRoot
 				inTable = 1
-				return
-			
-	# if the bridge isn't in the table yet, add it
+
+			# if the BPDU arrived on a different port
+			# for a Bridge_D that is already in the table
+			# then we know that there is a loop and that one
+			# of these ports needs to be disabled. 
+			# we will check for loops after we add the entry 
+			# in a different function checkForLoops
 	if (not bool(inTable)): 
-		addToBridgeTable(bridgeId, bridgeCost, portId, bridgeRoot)
+		addToBridgeTable(bridgeId, bridgeCost, portId)
 
 # add entry to bridge table. each entry includes: bridgeID, age, port, cost
-def addToBridgeTable(bridgeId, bridgeCost, portId, bridgeRoot):
-	print "ADDING TO BRIDGE TABLE " + str(bridgeId) + " " + str(portId)
-        bridges.append([bridgeId, time.time(), portId, bridgeCost, bridgeRoot])   
-	#sendBPDU()
+def addToBridgeTable(bridgeId, bridgeCost, portId):
+        bridges.append([bridgeId, time.time(), portId, bridgeCost])   
+	sendBPDU()
 	
-# check if a bridge has gone down
+# check if a bridge has gone down, check this
+# by seeing if it has not sent a message in 
+# 750 ms
 def checkBridgeAge():
 	global BRIDGE_AGE
 	
@@ -67,7 +71,8 @@ def checkBridgeAge():
 			sendBPDU()
 			flushForwardingTable()
 			flushBridgesTable()
-			
+	
+# add and update entries into the table		
 def updateForwardingTable(source, socket):
 	# check to see if source is in table
 	inTable = 0
@@ -75,8 +80,8 @@ def updateForwardingTable(source, socket):
  	# if it is update age
     	for entry in forwardingTable:
     		if entry[TABLE_ADDR] == source:
-        		updateForwardingAge(source)
-        		inTable = 1
+			entry[TABLE_AGE] = time.time()
+       			inTable = 1
 
 	# if not add it
    	if not bool(inTable):
@@ -85,17 +90,8 @@ def updateForwardingTable(source, socket):
 # add entry to forwarding table
 def addToForwardingTable(addr, socket):
 	# add port id(the socket fd), address, current time
-	print "ADDING TO FORWARDING TABLE " + str(addr) + " " + str(socket.fileno())
 	portId = socket.fileno()
 	forwardingTable.append([portId, addr, time.time()])	
-
-# update the age of a forwarding table entry
-def updateForwardingAge(addr):
-	global TABLE_ADDR, TABLE_AGE
-	
-	for entry in forwardingTable:
-		if entry[TABLE_ADDR] == addr:
-			entry[TABLE_AGE] = time.time()
 
 # check the forwarding table for timeouts
 def checkForwardingEntryAge():
@@ -160,30 +156,12 @@ def checkForLoops(source, cost2, portIdOfBPDU):
 	# our port connected to it
 	if cost == cost2:
 		if id > source:
-			print "odd loop"
 			resolveOddLoop(portIdOfBPDU)
-#		# if we detect a loop, and don't
-#		# deal with it from this end
-#		# need to flush the table if
-#		else:
-#			flushForwardingTable()
 
-# 
 		# if we detect a loop, and don't deal with it from this end,
-		# that means that the bridge we received a BPDU from and our bridge 
+		# that means that the BRIDGE we received a BPDU from and our bridge 
 		# have the same cost to root. But since our ID is lower, one of our ports
 		# connected to this particular LAN will be the designated port for that LAN
-		else: 
-                        # regardless of what port will be determined as the Designated Port for this LAN
-			# on the bridge, there will be atleast one change in port state for one of the ports connected 
-                        # Hence, the forwarding table must be flushed. 
-			flushForwardingTable()
- 			
-			# we are the designated bridge for the lan this particular port connects to (for now)
-			# now we need to find out what is the designated port on the bridge for this LAN
-			# incase there are multiple ports on this bridge that connect to this LAN
-			determineDesignatedPort(portIdofBPDU)
-
 		return
 
 	# if we receive two BPDUs with the same cost
@@ -192,9 +170,7 @@ def checkForLoops(source, cost2, portIdOfBPDU):
 	# than the source's 
 	for entry in bridges:
 		if entry[BRIDGE_COST] == cost2 and portIdOfBPDU != entry[BRIDGE_PORT_ID]:
-			if source < id:
-				print "even loop" + str(source)
-				
+			if source < id:		
 				# if there is a direct loop with the root
 				if entry[BRIDGE_ID] == source == root:
 					resolveRootLoop(portIdOfBPDU, entry[BRIDGE_PORT_ID])
@@ -204,10 +180,6 @@ def checkForLoops(source, cost2, portIdOfBPDU):
 				# if there is a larger loop with an even number of bridges
 				elif entry[BRIDGE_ID] != source and source != root:
 					resolveEvenLoop(portIdOfBPDU, entry[BRIDGE_PORT_ID])
-			# if we detect a loop and don't deal with
-			# it here, still need to flush table
-			else:
-				flushForwardingTable()
 
 # if there is a direct loop between the root and
 # our bridge, disable the port connected to the
@@ -218,13 +190,12 @@ def resolveRootLoop(portIdOfBPDU, portIdOfEntry):
 		disable = portIdOfBPDU
 	else:
 		disable = portIdOfEntry
-# P.S. one of the ports changed state here (im not sure which one)
-# but I think we have to print print("New root:" + id + "/" + root)
-# when the bridge changes its root port... not sure if it goes in the if or else clause  
+
 	if disable != -1 and not(disable in disabledPorts):
 		disabledPorts.append(disable)
 		print "Disabled port " + id + "/" + str(disable)
 		flushForwardingTable()
+		sendBPDU()
 
 # if there is a direct loop between this bridge
 # and another one and this bridge has a higher id
@@ -241,6 +212,7 @@ def resolveDirectLoop(portIdOfBPDU, portIdOfEntry):
 		disabledPorts.append(disable)
 		print "Disabled port " + id + "/" + str(disable)
 		flushForwardingTable()
+		sendBPDU()
 	
 # resolve loops with odd amount of bridges
 # if we have the higher id, disable our port
@@ -251,6 +223,7 @@ def resolveOddLoop(portIdOfBPDU):
 	       	disabledPorts.append(portIdOfBPDU)
                 print "Disabled port " + id + "/" + str(portIdOfBPDU)
                 flushForwardingTable()
+		sendBPDU()
 
 # if there is a loop between an even amount of bridges
 # disable the port that is not a root port or the
@@ -267,9 +240,27 @@ def resolveEvenLoop(portIdOfBPDU, portIdOfEntry):
 
 	if not(disable in disabledPorts):	
 	        disabledPorts.append(disable)
-		print "disabled even from " + source
         	print "Disabled port " + id + "/" + str(disable)
 	        flushForwardingTable()
+		sendBPDU()
+
+# at this point we know that we are the designated bridge for the LAN
+# that the port the BPDU arrived at is connected to.
+# However, we don't know if there are other ports that are connected to this LAN
+# if there are, we must pick the port with the lowest PortD connected to this LAN
+# The port with the lowest port ID will be the designatedPort for the LAN 
+def determineDesignatedPort(portIdOfBPDU):
+
+        # check if the port is a root port 
+        # designated ports cannot be root ports
+	# also check if the port Id is already in the disabledPorts list
+	# if it is not a root port and not in the disabledPorts list, it is a designated Port 
+        if (rootPortId != portIdOfBPDU) and not(portIdOfBPDU in disabledPorts):
+		print "Designated port " + id + "/" + str(portIdOfBPDU)
+
+		# any time a port changes state, we must flush the forwarding table
+		# in this case the port is changing to the 'designated port' state
+		flushForwardingTable() 
 
 if __name__ == "__main__":
 	id = sys.argv[1]
@@ -327,7 +318,6 @@ if __name__ == "__main__":
 	BRIDGE_AGE = 1
 	BRIDGE_PORT_ID = 2
 	BRIDGE_COST = 3
-	BRIDGE_ROOT = 4
 
 	# forwarding table to hold port ids, addresses, age
 	# of different entries
@@ -374,15 +364,13 @@ if __name__ == "__main__":
 			# if the message is a bpdu
 			if messageType == "bpdu":
 
-				#print "SOURCE " + str(source) + " " + str(messagePortId)						
-
 				# get data out of message
 				#id2 = dictionary["message"]["id"]
 				root2 = dictionary["message"]["root"]
 				cost2 = dictionary["message"]["cost"]
 			
 				# update bridge table
-				updateBridgeTable(str(source), cost2, messagePortId, root2)
+				updateBridgeTable(str(source), cost2, messagePortId)
 	
 				# compare data to current bridge
 				# update the root if the bpdu sends a 
@@ -413,7 +401,7 @@ if __name__ == "__main__":
 				# if the cost and root of the current bridge
 				# and the message that the bridge is from are
 				# the same but the port id the message is from is
-				# lower, update the root port
+				# lower or rootport hasn't been set update the root port
 				elif root2 == root and cost == (cost2 - 1) and messagePortId < rootPortId:
 					updateRootPort(messagePortId)
 
@@ -426,7 +414,11 @@ if __name__ == "__main__":
 				if id != source and id != root:
 					checkForLoops(source, cost2, messagePortId)
 
-				# designated ports
+				# after we have updated the Bridge Table, Root Port, and checked for loops, and disabled ports
+				# we can check if the port the BPDU arrive on is a designated port for the LAN
+				# if the port is not a root port or in the disabledPorts list, we can assume it is the designated port for the LAN
+				# since non-designated ports have already been disabled 
+                		determineDesignatedPort(messagePortId)
 			
 			# if message is data
 			elif messageType == "data":				
@@ -435,8 +427,8 @@ if __name__ == "__main__":
 
 		                # see if message is coming over a disabled port
 				# if so ignore it
-        			for portId in disabledPorts:
-                			if x.fileno() == portId:
+				for port in disabledPorts:
+					if port == x.fileno():
 						delegateMessage = 0
                                                 
 				if delegateMessage == 1:
@@ -457,11 +449,12 @@ if __name__ == "__main__":
 			                print "Received message " + str(messageId) + " on port " + str(sourcePortId) + " from " + str(source) + " to " + str(dest)
 							
 					# now make a decision about the message	
+
 					# if message being sent to this id, was sent by us,
 					# was sent on a host on the same LAN or was sent to
 					# itself, do not forward it
-       		        		if dest == id or dest == source or source == id or destPortId == sourcePortId:
-               					print "Not forwarding message " + str(messageId)
+    		        		if dest == id or dest == source or source == id or destPortId == sourcePortId:
+              					print "Not forwarding message " + str(messageId)
 	
 					# if dest in forwarding table, forward it
 					elif destPortId != -1:
@@ -478,7 +471,7 @@ if __name__ == "__main__":
 					# if dest is not in forwarding table, broadcast
 					else :
 						print "Broadcasting message " + str(messageId) + " to all ports"
-						
+							
 						# send over all ports, except one received on and disabled
 						for sock in sockets:
 							if sock.fileno() != x.fileno() and not(sock.fileno() in disabledPorts):
